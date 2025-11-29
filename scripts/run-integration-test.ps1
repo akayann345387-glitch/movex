@@ -60,6 +60,34 @@ function Get-ComposeServiceContainerId {
     return $null
 }
 
+# Wait for Postgres to accept connections (useful to avoid ride-service DB connect failures)
+$pgContainer = Get-ComposeServiceContainerId -serviceName 'postgres'
+if ($pgContainer) {
+    Write-Host "Waiting for Postgres container $pgContainer to accept connections..."
+    $pgMax = 30
+    $pgAttempt = 0
+    $pgReady = $false
+    while ($pgAttempt -lt $pgMax) {
+        $pgAttempt++
+        try {
+            $out = & docker exec $pgContainer pg_isready -U movex -d movex 2>&1
+            if ($LASTEXITCODE -eq 0) { $pgReady = $true; break }
+            Write-Host "pg_isready attempt $pgAttempt/$pgMax: $out"
+        } catch {
+            Write-Host "pg_isready attempt $pgAttempt failed: $_" -ForegroundColor Yellow
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $pgReady) {
+        Write-Error "Postgres did not become ready within timeout"
+        if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+        exit 2
+    }
+    Write-Host "Postgres is accepting connections"
+} else {
+    Write-Warning "Could not determine Postgres container id; continuing (ride-service may fail to connect)"
+}
+
 # Wait for ride-service health endpoint
 $healthUrl = 'http://localhost:8080/health'
 $maxAttempts = 60
