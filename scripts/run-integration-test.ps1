@@ -72,7 +72,7 @@ if ($pgContainer) {
         try {
             $out = & docker exec $pgContainer pg_isready -U movex -d movex 2>&1
             if ($LASTEXITCODE -eq 0) { $pgReady = $true; break }
-            Write-Host "pg_isready attempt $pgAttempt/$pgMax: $out"
+            Write-Host ([string]::Format("pg_isready attempt {0}/{1}: {2}", $pgAttempt, $pgMax, $out))
         } catch {
             Write-Host "pg_isready attempt $pgAttempt failed: $_" -ForegroundColor Yellow
         }
