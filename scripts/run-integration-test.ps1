@@ -56,9 +56,41 @@ while ($attempt -lt $maxAttempts) {
 }
 
 if ($attempt -ge $maxAttempts) {
-    Write-Error "ride-service did not become healthy within timeout"
-    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
-    exit 2
+    Write-Warning "ride-service did not become healthy via localhost within timeout — trying container-internal health check (useful for CI compose without published ports)"
+
+    # Try health check from inside the ride-service container (fallback for CI compose w/o host ports)
+    $rideContainer = Get-ComposeServiceContainerId -serviceName 'ride-service'
+    if ($rideContainer) {
+        $maxInner = 30
+        $inner = 0
+        while ($inner -lt $maxInner) {
+            try {
+                $inner++
+                Write-Host "Checking ride-service health from inside container (attempt $inner/$maxInner)..."
+                $out = & docker exec $rideContainer sh -c "curl -sS http://localhost:8080/health || true"
+                if ($out) {
+                    try {
+                        $parsed = $out | ConvertFrom-Json -ErrorAction Stop
+                        if ($parsed.status -eq 'ok') { Write-Host 'ride-service healthy (container-internal)'; break }
+                    } catch {
+                        # not JSON — continue
+                    }
+                }
+            } catch {
+                Start-Sleep -Seconds 2
+            }
+            Start-Sleep -Seconds 2
+        }
+        if ($inner -ge $maxInner) {
+            Write-Error "ride-service did not become healthy within container checks"
+            if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+            exit 2
+        }
+    } else {
+        Write-Error "ride-service did not become healthy within timeout and container id could not be determined"
+        if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+        exit 2
+    }
 }
 
 Write-Host "ride-service is healthy. Creating a test ride..."
