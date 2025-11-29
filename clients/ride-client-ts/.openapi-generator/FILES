@@ -1,0 +1,14 @@
+.gitignore
+.npmignore
+.openapi-generator-ignore
+api.ts
+base.ts
+common.ts
+configuration.ts
+docs/DefaultApi.md
+docs/Error.md
+docs/HealthGet200Response.md
+docs/Ride.md
+docs/RideCreate.md
+git_push.sh
+index.ts
