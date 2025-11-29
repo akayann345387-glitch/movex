@@ -51,10 +51,29 @@ function Get-ComposeServiceContainerId {
     } catch {
         # ignore and try alternate lookup
     }
-    # fallback: try to find a container with the service name in its name
+    # fallback: try docker ps by compose label (most robust), then by name patterns, then by image
     try {
-        $fallback = (& docker ps --filter "name=$serviceName" --format "{{.ID}}") -join "" | Trim
-        if (-not [string]::IsNullOrEmpty($fallback)) { return $fallback }
+        $byLabel = (& docker ps --filter "label=com.docker.compose.service=$serviceName" --format "{{.ID}}") -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($byLabel)) { return $byLabel }
+    } catch {
+    }
+    try {
+        # common pattern: projectname_service_1 or project-service-1, try partial matches
+        $pattern1 = "${serviceName}"
+        $byName = (& docker ps --filter "name=$pattern1" --format "{{.ID}}") -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($byName)) { return $byName }
+    } catch {
+    }
+    try {
+        $projPattern = (Get-ChildItem -Name .. | Where-Object { $_ -eq 'infra' } | Out-Null) ;
+        $byProjName = (& docker ps --format "{{.ID}} {{.Names}} {{.Image}}" | Select-String -Pattern "$serviceName" | ForEach-Object { ($_ -split ' ')[0] }) -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($byProjName)) { return $byProjName }
+    } catch {
+    }
+    try {
+        # try image name
+        $byImage = (& docker ps --filter "ancestor=postgres:15" --format "{{.ID}}") -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($byImage)) { return $byImage }
     } catch {
     }
     return $null
