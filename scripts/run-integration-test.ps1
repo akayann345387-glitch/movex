@@ -40,6 +40,26 @@ if ($env:COMPOSE_FILE) {
 Write-Host "Bringing up docker-compose stack (this may take a minute)..."
 & docker compose @composeArgs up -d --build
 
+# helper: resolve a service container id from docker compose or docker ps
+function Get-ComposeServiceContainerId {
+    param(
+        [string]$serviceName
+    )
+    try {
+        $id = (& docker compose @composeArgs ps -q $serviceName) -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($id)) { return $id }
+    } catch {
+        # ignore and try alternate lookup
+    }
+    # fallback: try to find a container with the service name in its name
+    try {
+        $fallback = (& docker ps --filter "name=$serviceName" --format "{{.ID}}") -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($fallback)) { return $fallback }
+    } catch {
+    }
+    return $null
+}
+
 # Wait for ride-service health endpoint
 $healthUrl = 'http://localhost:8080/health'
 $maxAttempts = 60
@@ -116,24 +136,6 @@ Write-Host "Created ride with id: $rideId"
 
 Start-Sleep -Seconds 2
 
-function Get-ComposeServiceContainerId {
-    param(
-        [string]$serviceName
-    )
-    try {
-        $id = (& docker compose @composeArgs ps -q $serviceName) -join "" | Trim
-        if (-not [string]::IsNullOrEmpty($id)) { return $id }
-    } catch {
-        # ignore and try alternate lookup
-    }
-    # fallback: try to find a container with 'postgres' in its name
-    try {
-        $fallback = (& docker ps --filter "name=postgres" --format "{{.ID}}") -join "" | Trim
-        if (-not [string]::IsNullOrEmpty($fallback)) { return $fallback }
-    } catch {
-    }
-    return $null
-}
 
 # Verify in Postgres container (with retries)
 $psqlSql = "SELECT passenger FROM rides WHERE uuid = '$rideId'::uuid;"
