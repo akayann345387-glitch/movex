@@ -88,13 +88,149 @@ if ($pgContainer) {
     $pgReady = $false
     while ($pgAttempt -lt $pgMax) {
         $pgAttempt++
-        try {
-            $out = & docker exec $pgContainer pg_isready -U movex -d movex 2>&1
-            if ($LASTEXITCODE -eq 0) { $pgReady = $true; break }
-            Write-Host ([string]::Format("pg_isready attempt {0}/{1}: {2}", $pgAttempt, $pgMax, $out))
-        } catch {
-            Write-Host "pg_isready attempt $pgAttempt failed: $_" -ForegroundColor Yellow
+            try {
+                $out = & docker exec $pgContainer pg_isready -U movex -d movex 2>&1
+                if ($LASTEXITCODE -eq 0) { $pgReady = $true; break }
+                Write-Host ([string]::Format("pg_isready attempt {0}/{1}: {2}", $pgAttempt, $pgMax, $out))
+            } catch {
+                Write-Host "pg_isready attempt $pgAttempt failed: $_" -ForegroundColor Yellow
+            }
         }
+        if (-not $pgReady) {
+            Write-Error "Postgres did not become ready within timeout"
+            if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+            exit 2
+        }
+        Write-Host "Postgres is accepting connections"
+    } else {
+        Write-Warning "Could not determine Postgres container id; continuing (ride-service may fail to connect)"
+    }
+    
+    # Wait for ride-service health endpoint
+    $healthUrl = 'http://localhost:8080/health'
+    $maxAttempts = 60
+    $attempt = 0
+    while ($attempt -lt $maxAttempts) {
+        try {
+            $attempt++
+            Write-Host "Checking ride-service health (attempt $attempt/$maxAttempts)..."
+            $resp = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3
+            if ($resp -and $resp.status -eq 'ok') { break }
+        } catch {
+            Start-Sleep -Seconds 5
+        }
+    }
+    
+    if ($attempt -ge $maxAttempts) {
+        Write-Warning "ride-service did not become healthy via localhost within timeout — trying container-internal health check (useful for CI compose without published ports)"
+        
+        # Try health check from inside the ride-service container (fallback for CI compose w/o host ports)
+        $rideContainer = Get-ComposeServiceContainerId -serviceName 'ride-service'
+        if ($rideContainer) {
+            $maxInner = 30
+            $inner = 0
+            while ($inner -lt $maxInner) {
+                try {
+                    $inner++
+                    Write-Host "Checking ride-service health from inside container (attempt $inner/$maxInner)..."
+                    $out = & docker exec $rideContainer sh -c "curl -sS http://localhost:8080/health || true"
+                    if ($out) {
+                        try {
+                            $parsed = $out | ConvertFrom-Json -ErrorAction Stop
+                            if ($parsed.status -eq 'ok') { Write-Host 'ride-service healthy (container-internal)'; break }
+                        } catch {
+                            # not JSON — continue
+                        }
+                    }
+                } catch {
+                    Start-Sleep -Seconds 2
+                }
+                Start-Sleep -Seconds 2
+            }
+            if ($inner -ge $maxInner) {
+                Write-Error "ride-service did not become healthy within container checks"
+                if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+                exit 2
+            }
+        } else {
+            Write-Error "ride-service did not become healthy within timeout and container id could not be determined"
+            if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+            exit 2
+        }
+    }
+    
+    Write-Host "ride-service is healthy. Creating a test ride..."
+    
+    $testPassenger = 'integration-test'
+    $body = @{ passenger = $testPassenger } | ConvertTo-Json
+    try {
+        $createResp = Invoke-RestMethod -Uri 'http://localhost:8080/rides' -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 10
+    } catch {
+        Write-Error "Failed to POST /rides: $_"
+        if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+        exit 3
+    }
+    
+    if (-not $createResp.id) {
+        Write-Error "Ride creation response missing id"
+        if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+        exit 4
+    }
+    
+    $rideId = $createResp.id
+    Write-Host "Created ride with id: $rideId"
+    
+    Start-Sleep -Seconds 2
+    
+    # Verify in Postgres container (with retries)
+    $psqlSql = "SELECT passenger FROM rides WHERE uuid = '$rideId'::uuid;"
+    Write-Host "Querying Postgres inside container for ride id $rideId"
+    $pgContainer = Get-ComposeServiceContainerId -serviceName 'postgres'
+    if (-not $pgContainer) {
+        Write-Error "Could not determine Postgres container id via 'docker compose ps -q postgres' or docker ps"
+        if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+        exit 5
+    }
+    
+    $maxDbAttempts = 6
+    $dbAttempt = 0
+    $psqlOutTrim = ''
+    while ($dbAttempt -lt $maxDbAttempts) {
+        try {
+            $dbAttempt++
+            Write-Host "Postgres query attempt $dbAttempt/$maxDbAttempts..."
+            $psqlOut = & docker exec $pgContainer psql -U movex -d movex -t -A -c $psqlSql
+            $psqlOutTrim = ($psqlOut -as [string]).Trim()
+            if ($psqlOutTrim -ne '') { break }
+        } catch {
+            Write-Host "Query attempt $dbAttempt failed: $_" -ForegroundColor Yellow
+        }
+        Start-Sleep -Seconds 2
+    }
+    
+    if ($psqlOutTrim -eq $testPassenger) {
+        Write-Host "Integration test PASSED: passenger in DB matches '$testPassenger'"
+        if (-not $NoCleanup) {
+            Write-Host "Cleaning up test ride row from Postgres..."
+            $deleteSql = "DELETE FROM rides WHERE uuid = '$rideId'::uuid;"
+            try {
+                & docker exec $pgContainer psql -U movex -d movex -c $deleteSql | Out-Host
+            } catch {
+                Write-Warning "Failed to delete test ride row id ${rideId}: $_"
+            }
+            Write-Host 'Cleaning up...'
+            & docker compose @composeArgs down -v
+        } else {
+            Write-Host "NoCleanup flag set; leaving test ride row in Postgres."
+        }
+        exit 0
+    } else {
+        Write-Error "Integration test FAILED: expected passenger '$testPassenger' but DB returned: '$psqlOutTrim'"
+        Write-Host "Dumping recent Postgres logs for diagnosis:"
+        & docker compose @composeArgs logs --no-color --tail 200 postgres
+        if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
+        exit 6
+    }
         Start-Sleep -Seconds 2
     }
     if (-not $pgReady) {
