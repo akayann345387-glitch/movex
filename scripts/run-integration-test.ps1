@@ -1,4 +1,4 @@
-<#
+﻿<#
 Runs a simple integration test for the MoveX dev stack.
 
 What it does:
@@ -8,6 +8,7 @@ What it does:
 - Verifies the ride row exists in Postgres by running `psql` inside the postgres container
 
 Usage: Run from PowerShell (may require elevated privileges for docker):
+#>
 param(
     [switch]$NoCleanup
 )
@@ -21,8 +22,23 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $infraDir = Join-Path $scriptRoot '..\infra'
 Set-Location $infraDir
 
+# Build compose arguments if COMPOSE_FILE env var is provided
+$composeArgs = @()
+if ($env:COMPOSE_FILE) {
+    $composeArgs += '-f'
+    $composeArgs += $env:COMPOSE_FILE
+} else {
+    # fallback to CI compose if present in infra (useful when running locally to reproduce CI)
+    $ciCompose = Join-Path $infraDir 'docker-compose.ci.yml'
+    if (Test-Path $ciCompose) {
+        $composeArgs += '-f'
+        $composeArgs += './docker-compose.ci.yml'
+        Write-Host "No COMPOSE_FILE env var set — falling back to './docker-compose.ci.yml'"
+    }
+}
+
 Write-Host "Bringing up docker-compose stack (this may take a minute)..."
-& docker compose up -d --build
+& docker compose @composeArgs up -d --build
 
 # Wait for ride-service health endpoint
 $healthUrl = 'http://localhost:8080/health'
@@ -41,7 +57,7 @@ while ($attempt -lt $maxAttempts) {
 
 if ($attempt -ge $maxAttempts) {
     Write-Error "ride-service did not become healthy within timeout"
-    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose down -v }
+    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
     exit 2
 }
 
@@ -53,13 +69,13 @@ try {
     $createResp = Invoke-RestMethod -Uri 'http://localhost:8080/rides' -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 10
 } catch {
     Write-Error "Failed to POST /rides: $_"
-    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose down -v }
+    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
     exit 3
 }
 
 if (-not $createResp.id) {
     Write-Error "Ride creation response missing id"
-    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose down -v }
+    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
     exit 4
 }
 
@@ -68,42 +84,63 @@ Write-Host "Created ride with id: $rideId"
 
 Start-Sleep -Seconds 2
 
-# Verify in Postgres container
-$psqlSql = "SELECT passenger FROM rides WHERE id = $rideId;"
+function Get-ComposeServiceContainerId {
+    param(
+        [string]$serviceName
+    )
+    try {
+        $id = (& docker compose @composeArgs ps -q $serviceName) -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($id)) { return $id }
+    } catch {
+        # ignore and try alternate lookup
+    }
+    # fallback: try to find a container with 'postgres' in its name
+    try {
+        $fallback = (& docker ps --filter "name=postgres" --format "{{.ID}}") -join "" | Trim
+        if (-not [string]::IsNullOrEmpty($fallback)) { return $fallback }
+    } catch {
+    }
+    return $null
+}
+
+# Verify in Postgres container (with retries)
+$psqlSql = "SELECT passenger FROM rides WHERE uuid = '$rideId'::uuid;"
 Write-Host "Querying Postgres inside container for ride id $rideId"
-try {
-    $psqlOut = & docker exec infra-postgres-1 psql -U movex -d movex -t -A -c $psqlSql
-} catch {
-    Write-Error "Failed to execute psql inside postgres container: $_"
-    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose down -v }
+$pgContainer = Get-ComposeServiceContainerId -serviceName 'postgres'
+if (-not $pgContainer) {
+    Write-Error "Could not determine Postgres container id via 'docker compose ps -q postgres' or docker ps"
+    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
     exit 5
 }
 
-$psqlOutTrim = $psqlOut -as [string]
-if ($null -eq $psqlOutTrim) { $psqlOutTrim = '' }
-$psqlOutTrim = $psqlOutTrim.Trim()
-
-if ($psqlOutTrim -eq $testPassenger) {
-    Write-Host "Integration test PASSED: passenger in DB matches '$testPassenger'"
-    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose down -v }
-    exit 0
-} else {
-    Write-Error "Integration test FAILED: expected passenger '$testPassenger' but DB returned: '$psqlOutTrim'"
-    Write-Host "Dumping recent Postgres logs for diagnosis:"
-    & docker compose logs --no-color --tail 200 postgres
-    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose down -v }
-    exit 6
+$maxDbAttempts = 6
+$dbAttempt = 0
+$psqlOutTrim = ''
+while ($dbAttempt -lt $maxDbAttempts) {
+    try {
+        $dbAttempt++
+        Write-Host "Postgres query attempt $dbAttempt/$maxDbAttempts..."
+        $psqlOut = & docker exec $pgContainer psql -U movex -d movex -t -A -c $psqlSql
+        $psqlOutTrim = ($psqlOut -as [string]).Trim()
+        if ($psqlOutTrim -ne '') { break }
+    } catch {
+        Write-Host "Query attempt $dbAttempt failed: $_" -ForegroundColor Yellow
+    }
+    Start-Sleep -Seconds 2
 }
+
 if ($psqlOutTrim -eq $testPassenger) {
     Write-Host "Integration test PASSED: passenger in DB matches '$testPassenger'"
     if (-not $NoCleanup) {
         Write-Host "Cleaning up test ride row from Postgres..."
-        $deleteSql = "DELETE FROM rides WHERE id = $rideId;"
+        $deleteSql = "DELETE FROM rides WHERE uuid = '$rideId'::uuid;"
         try {
-            & docker exec infra-postgres-1 psql -U movex -d movex -c $deleteSql | Out-Host
+            & docker exec $pgContainer psql -U movex -d movex -c $deleteSql | Out-Host
         } catch {
-            Write-Warning "Failed to delete test ride row id $rideId: $_"
+            Write-Warning "Failed to delete test ride row id ${rideId}: $_"
         }
+        Write-Host 'Cleaning up...'
+        & docker compose @composeArgs down -v
     } else {
         Write-Host "NoCleanup flag set; leaving test ride row in Postgres."
     }
@@ -111,6 +148,7 @@ if ($psqlOutTrim -eq $testPassenger) {
 } else {
     Write-Error "Integration test FAILED: expected passenger '$testPassenger' but DB returned: '$psqlOutTrim'"
     Write-Host "Dumping recent Postgres logs for diagnosis:"
-    & docker compose logs --no-color --tail 200 postgres
+    & docker compose @composeArgs logs --no-color --tail 200 postgres
+    if (-not $NoCleanup) { Write-Host 'Cleaning up...'; & docker compose @composeArgs down -v }
     exit 6
 }
